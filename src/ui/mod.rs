@@ -7,7 +7,7 @@ mod logs;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
 use crate::app::{App, MessageKind, Overlay};
@@ -18,14 +18,53 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.hit_areas.clear();
     let area = frame.area();
     if area.width < 30 || area.height < 12 {
-        let text =
-            Paragraph::new("Terminal too small\n\nResize to at least 30 × 12, or press q to quit.")
-                .alignment(ratatui::layout::Alignment::Center)
-                .style(Style::new().fg(Color::Yellow));
-        let [block] = Layout::vertical([Constraint::Length(4)])
+        frame.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "Terminal too small",
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Resize to at least 30 × 12."),
+        ];
+        match app.overlay {
+            Overlay::None => lines.push(Line::from("Press q to quit.")),
+            Overlay::Logs(index) => {
+                let label = app
+                    .services
+                    .get(index)
+                    .map(|service| {
+                        format!(
+                            "Logs: {} · {} · Esc/q to close",
+                            service.spec.name,
+                            service.status().label()
+                        )
+                    })
+                    .unwrap_or_else(|| "Logs · Esc/q to close".to_string());
+                lines.push(Line::from(Span::styled(
+                    label,
+                    Style::new().fg(Color::Cyan),
+                )));
+            }
+            Overlay::Help => lines.push(Line::from(Span::styled(
+                "Help is open · Esc/q to close",
+                Style::new().fg(Color::Cyan),
+            ))),
+            Overlay::ConfirmQuit => lines.push(Line::from(Span::styled(
+                format!("Quit? {} running · y quit / n cancel", app.running_count()),
+                Style::new().fg(Color::Yellow),
+            ))),
+        }
+        let [block] = Layout::vertical([Constraint::Length(8)])
             .flex(Flex::Center)
             .areas(area);
-        frame.render_widget(text, block);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .alignment(ratatui::layout::Alignment::Center)
+                .wrap(Wrap { trim: false })
+                .style(Style::new().fg(Color::Gray)),
+            block,
+        );
         return;
     }
 

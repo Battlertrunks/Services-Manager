@@ -138,6 +138,7 @@ async fn run_tui(
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     spawn_input_thread(event_tx);
+    let mut signals = TerminationSignals::new()?;
 
     let mut ticker = interval(Duration::from_millis(150));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -149,6 +150,11 @@ async fn run_tui(
 
         tokio::select! {
             _ = ticker.tick() => app.tick(),
+            _ = signals.recv() => {
+                // External SIGTERM/SIGHUP/SIGINT: skip the confirmation dialog, but still run
+                // the normal terminal and service cleanup path.
+                app.should_quit = true;
+            }
             maybe_event = event_rx.recv() => {
                 match maybe_event {
                     Some(Event::Key(key))
@@ -214,12 +220,54 @@ fn init_terminal() -> Result<DefaultTerminal> {
     // is disabled and child process groups are terminated before that restoration happens.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        process::kill_all_process_groups_now();
+        let _ = process::kill_all_process_groups_now();
         let _ = execute!(stdout(), DisableMouseCapture);
         previous_hook(info);
     }));
 
     Ok(terminal)
+}
+
+#[cfg(unix)]
+struct TerminationSignals {
+    sigterm: tokio::signal::unix::Signal,
+    sighup: tokio::signal::unix::Signal,
+    sigint: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TerminationSignals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            sigterm: signal(SignalKind::terminate())?,
+            sighup: signal(SignalKind::hangup())?,
+            sigint: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.sigterm.recv() => {}
+            _ = self.sighup.recv() => {}
+            _ = self.sigint.recv() => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct TerminationSignals;
+
+#[cfg(not(unix))]
+impl TerminationSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[derive(Debug)]

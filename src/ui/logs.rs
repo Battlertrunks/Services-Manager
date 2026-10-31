@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
-use crate::app::{App, Overlay};
+use crate::app::{App, Overlay, log_top_index};
 use crate::service::Service;
 use crate::ui::{popup_percent, status_color};
 
@@ -23,8 +23,8 @@ pub fn render(frame: &mut Frame, app: &mut App, index: usize) {
     };
     let status = service.status();
     let color = status_color(status);
-    let snapshot = service.logs_snapshot();
-    let total = snapshot.lines.len();
+    let meta = service.logs_meta();
+    let total = meta.len;
 
     let area = area(frame.area());
     frame.render_widget(Clear, area);
@@ -56,16 +56,12 @@ pub fn render(frame: &mut Frame, app: &mut App, index: usize) {
 
     let viewport = body_area.height as usize;
     app.logs.viewport = body_area.height;
-    let max_top = total.saturating_sub(viewport.max(1));
+    let start = log_top_index(&meta, body_area.height, app.logs.follow, app.logs.top_seq);
     if !app.logs.follow {
-        app.logs.top = app.logs.top.min(max_top);
+        app.logs.top_seq = meta.first_seq.saturating_add(start as u64);
     }
-    let start = if app.logs.follow {
-        max_top
-    } else {
-        app.logs.top
-    };
     let end = start.saturating_add(viewport).min(total);
+    let snapshot = service.logs_snapshot_range(start, end.saturating_sub(start));
 
     let mut info_spans = vec![
         Span::styled("●", Style::new().fg(color).add_modifier(Modifier::BOLD)),
@@ -92,9 +88,9 @@ pub fn render(frame: &mut Frame, app: &mut App, index: usize) {
         format!("  ·  {total} line{}", if total == 1 { "" } else { "s" }),
         Style::new().fg(Color::DarkGray),
     ));
-    if snapshot.dropped > 0 {
+    if meta.dropped > 0 {
         info_spans.push(Span::styled(
-            format!(" ({} older dropped)", snapshot.dropped),
+            format!(" ({} older dropped)", meta.dropped),
             Style::new().fg(Color::DarkGray),
         ));
     }
@@ -127,7 +123,8 @@ pub fn render(frame: &mut Frame, app: &mut App, index: usize) {
             body_area,
         );
     } else if viewport > 0 {
-        let lines: Vec<Line<'static>> = snapshot.lines[start..end]
+        let lines: Vec<Line<'static>> = snapshot
+            .lines
             .iter()
             .map(|log| {
                 let style = log_style(&service, &log.text);
@@ -168,11 +165,7 @@ fn log_style(service: &Arc<Service>, text: &str) -> Style {
     if text.starts_with("──") {
         return Style::new().fg(Color::DarkGray);
     }
-    if text.starts_with('✖')
-        || service.spec.line_is_error(&lower)
-        || lower.contains("error")
-        || lower.contains("failed")
-    {
+    if text.starts_with('✖') || service.spec.line_is_error(&lower) {
         return Style::new().fg(Color::Red);
     }
     if lower.contains("warn") {

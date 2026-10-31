@@ -25,6 +25,7 @@ tokio = { version = "1.48", features = [
     "sync",
     "time",
     "io-util",
+    "signal",
 ] }
 toml = "1.1"
 

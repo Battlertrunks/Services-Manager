@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::process;
-use crate::service::{Service, ServiceStatus};
+use crate::service::{LogMeta, Service, ServiceStatus};
 use crate::workspace::Workspace;
 
 const MESSAGE_LIFETIME: Duration = Duration::from_secs(5);
@@ -40,9 +40,22 @@ pub struct Message {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LogViewState {
     pub follow: bool,
-    pub top: usize,
+    /// Sequence number of the top visible line while paused. Sequence numbers stay stable when
+    /// the ring buffer drops old lines.
+    pub top_seq: u64,
     pub h_scroll: u16,
     pub viewport: u16,
+}
+
+/// Maps a paused sequence anchor to an index in the current ring buffer.
+pub(crate) fn log_top_index(meta: &LogMeta, viewport: u16, follow: bool, top_seq: u64) -> usize {
+    let max_top = meta.len.saturating_sub((viewport as usize).max(1));
+    if follow {
+        max_top
+    } else {
+        let anchored = top_seq.saturating_sub(meta.first_seq) as usize;
+        anchored.min(max_top)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -348,23 +361,10 @@ impl App {
         self.overlay = Overlay::Logs(index);
         self.logs = LogViewState {
             follow: true,
-            top: 0,
+            top_seq: 0,
             h_scroll: 0,
             viewport: self.logs.viewport,
         };
-    }
-
-    fn log_max_top(total: usize, viewport: u16) -> usize {
-        total.saturating_sub((viewport as usize).max(1))
-    }
-
-    fn current_log_top(&self, total: usize) -> usize {
-        let max_top = Self::log_max_top(total, self.logs.viewport);
-        if self.logs.follow {
-            max_top
-        } else {
-            self.logs.top.min(max_top)
-        }
     }
 
     pub fn scroll_logs(&mut self, delta: isize) {
@@ -374,17 +374,19 @@ impl App {
         let Some(service) = self.services.get(index) else {
             return;
         };
-        let total = service.log_len();
-        let max_top = Self::log_max_top(total, self.logs.viewport);
-        let current = self.current_log_top(total);
+        let meta = service.logs_meta();
+        let max_top = meta
+            .len
+            .saturating_sub((self.logs.viewport as usize).max(1));
+        let current = log_top_index(
+            &meta,
+            self.logs.viewport,
+            self.logs.follow,
+            self.logs.top_seq,
+        );
         let next = (current as isize + delta).clamp(0, max_top as isize) as usize;
-        if next >= max_top {
-            self.logs.follow = true;
-            self.logs.top = max_top;
-        } else {
-            self.logs.follow = false;
-            self.logs.top = next;
-        }
+        self.logs.top_seq = meta.first_seq.saturating_add(next as u64);
+        self.logs.follow = next >= max_top;
     }
 
     pub fn scroll_logs_page(&mut self, down: bool) {
@@ -393,16 +395,18 @@ impl App {
     }
 
     pub fn logs_to_top(&mut self) {
-        if matches!(self.overlay, Overlay::Logs(_)) {
+        if let Overlay::Logs(index) = self.overlay
+            && let Some(service) = self.services.get(index)
+        {
+            self.logs.top_seq = service.logs_meta().first_seq;
             self.logs.follow = false;
-            self.logs.top = 0;
         }
     }
 
     pub fn logs_to_bottom(&mut self) {
         if matches!(self.overlay, Overlay::Logs(_)) {
             self.logs.follow = true;
-            self.logs.top = 0;
+            self.logs.top_seq = 0;
         }
     }
 
@@ -414,13 +418,16 @@ impl App {
             if let Overlay::Logs(index) = self.overlay
                 && let Some(service) = self.services.get(index)
             {
-                let total = service.log_len();
-                self.logs.top = Self::log_max_top(total, self.logs.viewport);
+                let meta = service.logs_meta();
+                let max_top = meta
+                    .len
+                    .saturating_sub((self.logs.viewport as usize).max(1));
+                self.logs.top_seq = meta.first_seq.saturating_add(max_top as u64);
             }
             self.logs.follow = false;
         } else {
             self.logs.follow = true;
-            self.logs.top = 0;
+            self.logs.top_seq = 0;
         }
     }
 
@@ -437,7 +444,7 @@ impl App {
         {
             service.runtime.clear_logs();
             self.logs.follow = true;
-            self.logs.top = 0;
+            self.logs.top_seq = 0;
             self.notify(
                 MessageKind::Info,
                 format!("Cleared logs for {}", service.spec.name),
@@ -469,6 +476,13 @@ impl App {
         let selected_id = self
             .selected_service()
             .map(|service| service.spec.id.clone());
+        let metrics_changed = workspace.options.metrics_enabled != self.metrics_enabled
+            || (self.metrics_enabled
+                && workspace.options.metrics_interval != self.options.metrics_interval);
+        let log_capacity_changed = workspace.options.log_capacity != self.options.log_capacity;
+        let active_metrics_enabled = self.metrics_enabled;
+        let active_metrics_interval = self.options.metrics_interval;
+
         let mut previous: HashMap<String, Arc<Service>> = std::mem::take(&mut self.services)
             .into_iter()
             .map(|service| (service.spec.id.clone(), service))
@@ -480,7 +494,7 @@ impl App {
         for spec in workspace.specs {
             let id = spec.id.clone();
             let service = if let Some(existing) = previous.remove(&id) {
-                if existing.spec == spec {
+                if existing.spec == spec && !log_capacity_changed {
                     preserved += 1;
                     existing
                 } else {
@@ -496,8 +510,17 @@ impl App {
         self.services = new_services;
         self.warnings = workspace.warnings;
         self.config_path = workspace.config_path;
-        self.metrics_enabled = workspace.options.metrics_enabled;
         self.options = workspace.options;
+        if metrics_changed {
+            // The sampler is created at startup. Keep reporting the settings that are actually
+            // active, and tell the user how to apply the new ones.
+            self.options.metrics_enabled = active_metrics_enabled;
+            self.options.metrics_interval = active_metrics_interval;
+            self.warnings.push(
+                "Metrics settings changed in config; restart services-manager to apply them."
+                    .to_string(),
+            );
+        }
         self.selected = selected_id
             .and_then(|id| {
                 self.services
@@ -511,13 +534,21 @@ impl App {
 
         let added = self.services.len().saturating_sub(preserved + updated);
         let removed = previous.len();
+        let mut message = format!(
+            "Rescanned: {} service{} ({added} new, {updated} updated, {removed} removed)",
+            self.services.len(),
+            plural(self.services.len())
+        );
+        if metrics_changed {
+            message.push_str(" · restart for metrics changes");
+        }
         self.notify(
-            MessageKind::Info,
-            format!(
-                "Rescanned: {} service{} ({added} new, {updated} updated, {removed} removed)",
-                self.services.len(),
-                plural(self.services.len())
-            ),
+            if metrics_changed {
+                MessageKind::Warning
+            } else {
+                MessageKind::Info
+            },
+            message,
         );
     }
 
@@ -693,7 +724,7 @@ impl App {
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "auto-discovery".to_string())
             ),
-            "  start commands: auto-detected (dev → start → serve), then npm run <script>"
+            "  start commands: auto-detected (dev → start → serve), then npm start / npm run <script>"
                 .to_string(),
             format!(
                 "  ready timeout: {}s · stop timeout: {}s · logs: {} lines",
@@ -737,6 +768,7 @@ mod tests {
         ServiceSpec {
             id: name.to_string(),
             name: name.to_string(),
+            path_label: name.to_string(),
             path: PathBuf::from("."),
             kind: ProjectKind::App,
             command: CommandSpec {
@@ -828,7 +860,7 @@ mod tests {
     fn log_scrolling_starts_following_and_pauses_when_scrolled_up() {
         let mut app = test_app(1);
         let service = app.services[0].clone();
-        service.runtime.begin_start(None);
+        service.runtime.begin_start(None).unwrap();
         let run_id = service
             .runtime
             .install_run(42, Arc::new(std::sync::atomic::AtomicBool::new(false)))
@@ -842,13 +874,62 @@ mod tests {
 
         app.scroll_logs(-1);
         assert!(!app.logs.follow);
-        assert_eq!(app.logs.top, 14);
+        assert_eq!(app.logs.top_seq, 14);
         app.logs_to_top();
-        assert_eq!(app.logs.top, 0);
+        assert_eq!(app.logs.top_seq, 0);
         app.logs_to_bottom();
         assert!(app.logs.follow);
         app.toggle_log_follow();
         assert!(!app.logs.follow);
+        assert_eq!(app.logs.top_seq, 15);
+    }
+
+    #[test]
+    fn renders_scrolled_log_modal_from_a_large_buffer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::sync::atomic::AtomicBool;
+
+        let mut app = test_app(1);
+        let service = app.services[0].clone();
+        service.runtime.begin_start(None).unwrap();
+        let run_id = service
+            .runtime
+            .install_run(42, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        for index in 0..250 {
+            service.ingest_log(run_id, &format!("line {index}"));
+        }
+        app.overlay = Overlay::Logs(0);
+        app.logs.follow = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        app.scroll_logs(-10);
+        assert!(!app.logs.follow);
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        service
+            .runtime
+            .finish_run(run_id, crate::service::RunOutcome::Stopped);
+    }
+
+    #[test]
+    fn paused_log_anchor_survives_ring_buffer_wrap() {
+        let meta = LogMeta {
+            len: 5,
+            dropped: 3,
+            first_seq: 3,
+        };
+        // Sequence 5 is still line index 2 after three older lines were dropped.
+        assert_eq!(log_top_index(&meta, 2, false, 5), 2);
+        // A dropped anchor falls back to the oldest retained line.
+        assert_eq!(log_top_index(&meta, 2, false, 1), 0);
+        assert_eq!(log_top_index(&meta, 2, true, 0), 3);
     }
 
     #[test]
@@ -898,6 +979,45 @@ mod tests {
     }
 
     #[test]
+    fn rescan_recreates_services_when_log_capacity_changes_and_warns_about_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"alpha","scripts":{"dev":"vite"},"dependencies":{"vue":"^3"}}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::load(root, None, true).unwrap();
+        let mut app = App::new(workspace, None, true);
+        let before = Arc::clone(&app.services[0]);
+        assert!(app.metrics_enabled);
+
+        std::fs::write(
+            root.join("services-manager.toml"),
+            "[workspace]\nlog_buffer_lines = 5000\nmetrics = false\nmetrics_interval_ms = 5000\n",
+        )
+        .unwrap();
+
+        app.rescan();
+        assert_eq!(app.services.len(), 1);
+        assert!(
+            !Arc::ptr_eq(&before, &app.services[0]),
+            "changed log capacity should rebuild the service"
+        );
+        assert!(
+            app.metrics_enabled,
+            "startup metric state should remain active"
+        );
+        assert!(
+            app.warnings
+                .iter()
+                .any(|warning| warning.contains("restart"))
+        );
+        assert_eq!(app.current_message().unwrap().kind, MessageKind::Warning);
+        assert!(app.current_message().unwrap().text.contains("restart"));
+    }
+
+    #[test]
     fn quit_needs_confirmation_only_when_services_run() {
         let mut app = test_app(1);
         app.request_quit();
@@ -905,7 +1025,7 @@ mod tests {
         assert_eq!(app.overlay, Overlay::None);
 
         let mut app = test_app(1);
-        app.services[0].runtime.begin_start(None);
+        app.services[0].runtime.begin_start(None).unwrap();
         app.services[0]
             .runtime
             .install_run(7, Arc::new(std::sync::atomic::AtomicBool::new(false)))

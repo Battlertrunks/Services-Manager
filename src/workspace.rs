@@ -185,9 +185,12 @@ fn quote_arg(arg: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceSpec {
-    /// Stable identifier, usually the path relative to the workspace root.
+    /// Stable unique identifier. Auto-discovered services use their relative path; configured
+    /// services include their config index so several entries can share a directory.
     pub id: String,
     pub name: String,
+    /// Human-readable path relative to the workspace root.
+    pub path_label: String,
     pub path: PathBuf,
     pub kind: ProjectKind,
     pub command: CommandSpec,
@@ -200,7 +203,7 @@ pub struct ServiceSpec {
 
 impl ServiceSpec {
     pub fn relative_path(&self) -> String {
-        self.id.clone()
+        self.path_label.clone()
     }
 
     pub fn line_is_error(&self, line_lower: &str) -> bool {
@@ -288,7 +291,7 @@ impl Workspace {
 
         if configured_services && let Some(config) = &file_config {
             for (index, entry) in config.services.iter().enumerate() {
-                match build_configured_service(&root, entry, &options, &mut warnings) {
+                match build_configured_service(&root, entry, index, &options, &mut warnings) {
                     Ok(spec) => specs.push(spec),
                     Err(message) => {
                         warnings.push(format!("services[{index}]: {message}"));
@@ -469,6 +472,7 @@ impl WorkspaceOptions {
 fn build_configured_service(
     root: &Path,
     entry: &FileService,
+    index: usize,
     options: &WorkspaceOptions,
     warnings: &mut Vec<String>,
 ) -> std::result::Result<ServiceSpec, String> {
@@ -520,9 +524,11 @@ fn build_configured_service(
             .unwrap_or(ProjectKind::App)
     });
 
+    let path_label = relative_id(root, &path);
     Ok(ServiceSpec {
-        id: relative_id(root, &path),
+        id: format!("{path_label}#{}", index + 1),
         name,
+        path_label,
         path,
         kind,
         command,
@@ -563,6 +569,7 @@ fn build_root_service(
     Ok(Some(ServiceSpec {
         id: ".".to_string(),
         name,
+        path_label: ".".to_string(),
         path: root.to_path_buf(),
         kind,
         command: CommandSpec::npm_script(&script),
@@ -748,9 +755,11 @@ fn build_discovered_service(
         .unwrap_or_else(|| "service".to_string());
     let kind = infer_kind(&name, &package.all_deps(), &package.scripts);
 
+    let path_label = relative_id(root, dir);
     Some(ServiceSpec {
-        id: relative_id(root, dir),
+        id: path_label.clone(),
         name,
+        path_label,
         path: dir.to_path_buf(),
         kind,
         command: CommandSpec::npm_script(&script),
@@ -1151,6 +1160,40 @@ ready_patterns = ["orders api ready"]
     }
 
     #[test]
+    fn configured_services_can_share_a_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("worker")).unwrap();
+        fs::write(
+            root.join("services-manager.toml"),
+            r#"
+[[services]]
+name = "Worker"
+path = "worker"
+start = ["sh", "-c", "sleep 30"]
+
+[[services]]
+name = "Worker Cron"
+path = "worker"
+start = ["sh", "-c", "sleep 30"]
+"#,
+        )
+        .unwrap();
+
+        let workspace = Workspace::load(root, None, true).unwrap();
+        assert_eq!(workspace.specs.len(), 2);
+        let names: Vec<_> = workspace
+            .specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Worker", "Worker Cron"]);
+        assert_ne!(workspace.specs[0].id, workspace.specs[1].id);
+        assert_eq!(workspace.specs[0].path_label, "worker");
+        assert_eq!(workspace.specs[1].path_label, "worker");
+    }
+
+    #[test]
     fn falls_back_to_root_package() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
@@ -1180,6 +1223,7 @@ ready_patterns = ["orders api ready"]
         let spec = ServiceSpec {
             id: "test".into(),
             name: "test".into(),
+            path_label: "test".into(),
             path: PathBuf::from("."),
             kind: ProjectKind::App,
             command: CommandSpec::npm_script("dev"),

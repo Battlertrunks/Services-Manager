@@ -89,7 +89,7 @@ fn render_card(frame: &mut Frame, app: &mut App, index: usize, rect: Rect) {
 
     let status_line = status_line(&service, status, inner.width);
     let name_style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
-    let path = if service.spec.id == "." {
+    let path = if service.spec.path_label == "." {
         "current directory".to_string()
     } else {
         service.spec.relative_path()

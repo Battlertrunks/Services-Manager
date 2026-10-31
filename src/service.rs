@@ -55,7 +55,13 @@ pub struct LogLine {
 #[derive(Debug, Clone, Default)]
 pub struct LogSnapshot {
     pub lines: Vec<LogLine>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogMeta {
+    pub len: usize,
     pub dropped: u64,
+    pub first_seq: u64,
 }
 
 #[derive(Debug)]
@@ -63,6 +69,7 @@ pub struct LogBuffer {
     lines: VecDeque<LogLine>,
     capacity: usize,
     dropped: u64,
+    next_seq: u64,
 }
 
 impl LogBuffer {
@@ -71,6 +78,7 @@ impl LogBuffer {
             lines: VecDeque::with_capacity(capacity.min(512)),
             capacity: capacity.max(1),
             dropped: 0,
+            next_seq: 0,
         }
     }
 
@@ -80,22 +88,28 @@ impl LogBuffer {
             self.dropped = self.dropped.saturating_add(1);
         }
         self.lines.push_back(line);
+        self.next_seq = self.next_seq.saturating_add(1);
     }
 
     pub fn clear(&mut self) {
         self.lines.clear();
         self.dropped = 0;
+        self.next_seq = 0;
     }
 
-    pub fn snapshot(&self) -> LogSnapshot {
-        LogSnapshot {
-            lines: self.lines.iter().cloned().collect(),
+    pub fn meta(&self) -> LogMeta {
+        LogMeta {
+            len: self.lines.len(),
             dropped: self.dropped,
+            first_seq: self.next_seq.saturating_sub(self.lines.len() as u64),
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.lines.len()
+    /// Clones only the visible slice of the buffer. `start` is an index into the current buffer.
+    pub fn snapshot_range(&self, start: usize, count: usize) -> LogSnapshot {
+        LogSnapshot {
+            lines: self.lines.iter().skip(start).take(count).cloned().collect(),
+        }
     }
 }
 
@@ -186,12 +200,12 @@ impl ServiceRuntime {
         *read(&self.metrics)
     }
 
-    pub fn logs_snapshot(&self) -> LogSnapshot {
-        lock(&self.logs).snapshot()
+    pub fn logs_meta(&self) -> LogMeta {
+        lock(&self.logs).meta()
     }
 
-    pub fn log_len(&self) -> usize {
-        lock(&self.logs).len()
+    pub fn logs_snapshot_range(&self, start: usize, count: usize) -> LogSnapshot {
+        lock(&self.logs).snapshot_range(start, count)
     }
 
     pub fn clear_logs(&self) {
@@ -205,14 +219,17 @@ impl ServiceRuntime {
         })
     }
 
-    pub(crate) fn begin_start(&self, initial_port: Option<u16>) {
+    pub(crate) fn begin_start(&self, initial_port: Option<u16>) -> Result<(), String> {
         let mut inner = lock(&self.inner);
+        if inner.run.is_some() {
+            return Err("service is already running".to_string());
+        }
         inner.last_error = None;
         inner.port = initial_port;
         inner.started_at = Some(Instant::now());
-        inner.run = None;
         *write(&self.metrics) = ServiceMetrics::default();
         *write(&self.status) = ServiceStatus::Starting;
+        Ok(())
     }
 
     pub(crate) fn install_run(&self, pid: u32, stop_requested: Arc<AtomicBool>) -> Option<u64> {
@@ -231,7 +248,9 @@ impl ServiceRuntime {
 
     pub(crate) fn spawn_failed(&self, message: String) {
         let mut inner = lock(&self.inner);
-        inner.run = None;
+        if inner.run.is_some() {
+            return;
+        }
         inner.started_at = None;
         inner.last_error = Some(message);
         *write(&self.metrics) = ServiceMetrics::default();
@@ -251,6 +270,17 @@ impl ServiceRuntime {
             *write(&self.status) = ServiceStatus::Stopping;
         }
         request
+    }
+
+    pub(crate) fn begin_cleanup(&self, run_id: u64) {
+        let inner = lock(&self.inner);
+        if !inner.run.as_ref().is_some_and(|run| run.id == run_id) {
+            return;
+        }
+        let mut status = write(&self.status);
+        if matches!(*status, ServiceStatus::Starting | ServiceStatus::Ready) {
+            *status = ServiceStatus::Stopping;
+        }
     }
 
     pub(crate) fn is_run_active(&self, run_id: u64) -> bool {
@@ -349,12 +379,12 @@ impl Service {
         self.runtime.metrics()
     }
 
-    pub fn logs_snapshot(&self) -> LogSnapshot {
-        self.runtime.logs_snapshot()
+    pub fn logs_meta(&self) -> LogMeta {
+        self.runtime.logs_meta()
     }
 
-    pub fn log_len(&self) -> usize {
-        self.runtime.log_len()
+    pub fn logs_snapshot_range(&self, start: usize, count: usize) -> LogSnapshot {
+        self.runtime.logs_snapshot_range(start, count)
     }
 
     pub(crate) fn append_marker(&self, text: impl Into<String>) {
@@ -424,6 +454,7 @@ mod tests {
         let spec = ServiceSpec {
             id: "demo".into(),
             name: "demo".into(),
+            path_label: "demo".into(),
             path: PathBuf::from("."),
             kind: ProjectKind::App,
             command: CommandSpec {
@@ -448,16 +479,25 @@ mod tests {
                 text: i.to_string(),
             });
         }
-        let snapshot = buffer.snapshot();
+        let meta = buffer.meta();
+        assert_eq!(meta.len, 3);
+        assert_eq!(meta.dropped, 2);
+        assert_eq!(meta.first_seq, 2);
+
+        let snapshot = buffer.snapshot_range(0, 3);
         assert_eq!(snapshot.lines.len(), 3);
-        assert_eq!(snapshot.dropped, 2);
         assert_eq!(snapshot.lines[2].text, "4");
+
+        let visible = buffer.snapshot_range(1, 2);
+        assert_eq!(visible.lines.len(), 2);
+        assert_eq!(visible.lines[0].text, "3");
+        assert_eq!(visible.lines[1].text, "4");
     }
 
     #[test]
     fn ready_and_error_lines_drive_status() {
         let service = test_service();
-        service.runtime.begin_start(None);
+        service.runtime.begin_start(None).unwrap();
         let run_id = service
             .runtime
             .install_run(123, Arc::new(AtomicBool::new(false)))
@@ -482,7 +522,7 @@ mod tests {
     #[test]
     fn detects_ports_and_keeps_logs_after_stop() {
         let service = test_service();
-        service.runtime.begin_start(None);
+        service.runtime.begin_start(None).unwrap();
         let run_id = service
             .runtime
             .install_run(999, Arc::new(AtomicBool::new(false)))
@@ -491,13 +531,13 @@ mod tests {
         assert_eq!(service.port(), Some(5173));
         service.runtime.finish_run(run_id, RunOutcome::Exited);
         assert_eq!(service.status(), ServiceStatus::Stopped);
-        assert_eq!(service.logs_snapshot().lines.len(), 1);
+        assert_eq!(service.logs_meta().len, 1);
     }
 
     #[test]
     fn clean_exit_after_an_error_stays_red() {
         let service = test_service();
-        service.runtime.begin_start(None);
+        service.runtime.begin_start(None).unwrap();
         let run_id = service
             .runtime
             .install_run(77, Arc::new(AtomicBool::new(false)))
@@ -511,7 +551,7 @@ mod tests {
     #[test]
     fn stale_run_messages_are_ignored() {
         let service = test_service();
-        service.runtime.begin_start(None);
+        service.runtime.begin_start(None).unwrap();
         let run_id = service
             .runtime
             .install_run(12, Arc::new(AtomicBool::new(false)))
@@ -519,6 +559,6 @@ mod tests {
         service.runtime.finish_run(run_id, RunOutcome::Stopped);
         service.ingest_log(run_id, "ready in 1ms");
         assert_eq!(service.status(), ServiceStatus::Stopped);
-        assert_eq!(service.logs_snapshot().lines.len(), 0);
+        assert_eq!(service.logs_meta().len, 0);
     }
 }
