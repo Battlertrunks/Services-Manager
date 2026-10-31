@@ -255,9 +255,3 @@ Layout of the source:
   including descendants that ignore SIGTERM, and external SIGTERM/SIGHUP/SIGINT trigger the same
   cleanup. If the app was force-killed with SIGKILL, find the leftover node process with
   `lsof -i :<port>` and stop it.
-# Services-Manager
-# Services-Manager
-# Services-Manager
-# Services-Manager
-# Services-Manager
-# Services-Manager
