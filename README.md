@@ -32,7 +32,9 @@ and watch CPU/memory without leaving the terminal.
 - CPU and resident-memory sampling for the entire npm → shell → node process tree.
 - Automatic project discovery and type detection (MFE vs service), with an optional TOML config.
 - Every service runs in its own process group, so stopping it also stops the node process it
-  spawned. Services are stopped when the TUI exits (with confirmation if any are running).
+  spawned. Leftover descendants are cleaned up and escalated to SIGKILL when necessary.
+- Services are stopped on normal exit (with confirmation if any are running), on external
+  SIGTERM/SIGHUP/SIGINT, and by a panic hook.
 
 ## Requirements
 
@@ -127,7 +129,8 @@ recorded error shows as **stopped**; a clean exit after an error stays red.
 The `Logs` button (or `o`) opens the selected service's live output. Both stdout and stderr are
 captured, ANSI colours are stripped, and the last 2000 lines are retained in memory. Logs survive
 stop/restart and are cleared when the service definition is updated by a rescan, or explicitly
-with `c` in the modal. Nothing is written to disk.
+with `c` in the modal. Pausing keeps the same line anchored even while new output pushes older
+lines out of the ring buffer. Nothing is written to disk.
 
 ## Metrics
 
@@ -211,8 +214,11 @@ Notes:
 - If `start` is omitted, the command is inferred from the project's `package.json`, just like
   auto-discovery. `path` must contain a `package.json` in that case.
 - `ready_patterns` and `error_patterns` extend the built-in lists; matching is case-insensitive.
-- Service definitions are refreshed on `r` (rescan) only when nothing is running. Workspace-wide
-  sampler and log-buffer settings are read at startup, so restart the app after changing those.
+- Several configured services may point at the same `path` with different names, commands, and
+  environments.
+- Service definitions are refreshed on `r` (rescan) only when nothing is running. A changed service
+  is recreated and starts with an empty log buffer. Changing `log_buffer_lines` recreates the
+  services; changing metrics enablement or interval requires restarting the app.
 - Only trust workspaces you control: package scripts and configured commands are executed as-is.
 
 ## Development
@@ -245,8 +251,11 @@ Layout of the source:
 - **A project is missing** — it needs a `dev`/`start`/`serve` script. Check the warnings under `?`,
   or define it explicitly in `services-manager.toml`. Nested projects deeper than two levels
   require a config entry.
-- **Ports are occupied after a crash** — stopping normally kills the whole process group. If the
-  app was force-killed, find the leftover node process with `lsof -i :<port>` and stop it.
+- **Ports are occupied after a crash** — stopping and quitting clean up the whole process group,
+  including descendants that ignore SIGTERM, and external SIGTERM/SIGHUP/SIGINT trigger the same
+  cleanup. If the app was force-killed with SIGKILL, find the leftover node process with
+  `lsof -i :<port>` and stop it.
+# Services-Manager
 # Services-Manager
 # Services-Manager
 # Services-Manager
