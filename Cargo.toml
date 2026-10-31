@@ -1,0 +1,36 @@
+[package]
+name = "services-manager"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A terminal dashboard for running local MFEs and micro-services"
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+chrono = "0.4"
+crossterm = "0.29"
+libc = "0.2"
+ratatui = "0.30"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+shell-words = "1.1"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+tokio = { version = "1.48", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "sync",
+    "time",
+    "io-util",
+] }
+toml = "1.1"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[profile.release]
+lto = "thin"
+strip = true

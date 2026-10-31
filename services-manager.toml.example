@@ -1,0 +1,66 @@
+# services-manager example configuration
+#
+# Copy this file to <workspace>/services-manager.toml and edit it.
+# If you define any [[services]] tables, automatic discovery is disabled.
+# Leave the services list out to keep auto-discovery and only tune [workspace].
+
+[workspace]
+# How many directory levels to scan for package.json files (1-6).
+# 2 finds both ./shell and ./apps/shell.
+scan_depth = 2
+
+# A running service with no recognized readiness line turns green after this.
+ready_timeout_secs = 8
+
+# SIGTERM grace period before process groups are SIGKILLed (1-60).
+stop_timeout_secs = 5
+
+# In-memory lines kept per service (100-100000).
+log_buffer_lines = 2000
+
+# How often the background sampler reads the process tree (500-60000 ms).
+metrics_interval_ms = 2000
+
+# Set false to disable CPU/memory sampling for the whole workspace.
+metrics = true
+
+# --- Explicit services -----------------------------------------------------
+# `path` is relative to the workspace root.
+# `type` / `kind` is optional: mfe | service | app.
+# `start` accepts a string or an argv array. If omitted, package.json is used.
+# Commands are executed directly, not through a shell. For shell syntax use
+# ["sh", "-c", "..."].
+
+[[services]]
+name = "Shell MFE"
+path = "apps/shell"
+type = "mfe"
+port = 5173
+start = "npm run dev"
+env = { VITE_API_URL = "http://localhost:4000" }
+ready_patterns = ["shell ready"]
+stop_timeout_secs = 5
+
+[[services]]
+name = "Checkout MFE"
+path = "apps/checkout"
+type = "mfe"
+start = ["npm", "run", "start"]
+env = { VITE_API_URL = "http://localhost:4000" }
+
+[[services]]
+name = "Orders API"
+path = "services/orders"
+kind = "service"
+port = 4000
+start = ["npm", "run", "start:dev"]
+env = { PORT = "4000", NODE_ENV = "development" }
+ready_patterns = ["Orders API ready"]
+error_patterns = ["unable to connect to database"]
+
+[[services]]
+name = "Payments API"
+path = "services/payments"
+kind = "service"
+# No start command: inferred from package.json (dev -> start -> serve).
+ready_patterns = ["Payments API listening"]
