@@ -1,18 +1,20 @@
 //! Application state and input handling.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::bundles::{Bundle, BundleStore};
 use crate::process;
 use crate::service::{LogMeta, Service, ServiceStatus};
 use crate::workspace::Workspace;
 
 const MESSAGE_LIFETIME: Duration = Duration::from_secs(5);
+const MAX_BUNDLE_NAME_CHARS: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -20,6 +22,43 @@ pub enum Overlay {
     Logs(usize),
     Help,
     ConfirmQuit,
+    Bundles,
+    BundleEditor,
+    BundleDelete(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BundlePane {
+    #[default]
+    List,
+    Members,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BundleEditorFocus {
+    #[default]
+    Name,
+    Services,
+}
+
+#[derive(Debug, Clone)]
+pub struct BundleEditorState {
+    pub bundle_id: Option<i64>,
+    pub name: String,
+    pub selected: BTreeSet<String>,
+    pub cursor: usize,
+    pub focus: BundleEditorFocus,
+    pub error: Option<String>,
+    pub missing_services: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BundleUiState {
+    pub selected: usize,
+    pub member_selected: usize,
+    pub pane: BundlePane,
+    pub editor: Option<BundleEditorState>,
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,10 +121,16 @@ pub struct App {
     pub hit_areas: Vec<CardHitArea>,
     pub should_quit: bool,
     pub metrics_enabled: bool,
+    pub bundles: Vec<Bundle>,
+    pub active_bundle_id: Option<i64>,
+    pub bundle_ui: BundleUiState,
     message: Option<Message>,
     config_override: Option<PathBuf>,
     metrics_cli_enabled: bool,
     services_dirty: bool,
+    bundle_store: Option<BundleStore>,
+    bundle_error: Option<String>,
+    log_return: Overlay,
 }
 
 impl App {
@@ -120,11 +165,31 @@ impl App {
             grid_offset_rows: 0,
             hit_areas: Vec::new(),
             should_quit: false,
+            bundles: Vec::new(),
+            active_bundle_id: None,
+            bundle_ui: BundleUiState::default(),
             message: None,
             config_override,
             metrics_cli_enabled,
             services_dirty: false,
+            bundle_store: None,
+            bundle_error: None,
+            log_return: Overlay::None,
         };
+
+        match BundleStore::open(&app.root) {
+            Ok(store) => {
+                app.bundle_store = Some(store);
+                if let Some(error) = app.reload_bundles() {
+                    app.warnings.push(error);
+                }
+            }
+            Err(err) => {
+                let message = format!("Bundles unavailable: {err}");
+                app.bundle_error = Some(message.clone());
+                app.warnings.push(message);
+            }
+        }
 
         let count = app.services.len();
         if count == 0 {
@@ -161,6 +226,664 @@ impl App {
 
     pub fn take_services_dirty(&mut self) -> bool {
         std::mem::take(&mut self.services_dirty)
+    }
+
+    pub fn bundle_error(&self) -> Option<&str> {
+        self.bundle_error.as_deref()
+    }
+
+    pub fn bundle_db_path(&self) -> Option<&Path> {
+        self.bundle_store.as_ref().map(BundleStore::path)
+    }
+
+    fn reload_bundles(&mut self) -> Option<String> {
+        let Some(store) = &self.bundle_store else {
+            let error = "Bundle storage is unavailable".to_string();
+            self.bundle_error = Some(error.clone());
+            return Some(error);
+        };
+        match store.list() {
+            Ok(bundles) => {
+                self.bundles = bundles;
+                self.bundle_error = None;
+                if self
+                    .active_bundle_id
+                    .is_some_and(|id| !self.bundles.iter().any(|bundle| bundle.id == id))
+                {
+                    self.active_bundle_id = None;
+                }
+                self.clamp_bundle_ui();
+                None
+            }
+            Err(err) => {
+                let error = format!("Bundle database error: {err}");
+                self.bundle_error = Some(error.clone());
+                Some(error)
+            }
+        }
+    }
+
+    pub fn open_bundles(&mut self) {
+        let error = self.reload_bundles();
+        if let Some(active_id) = self.active_bundle_id
+            && let Some(position) = self
+                .bundles
+                .iter()
+                .position(|bundle| bundle.id == active_id)
+        {
+            self.bundle_ui.selected = position;
+        }
+        self.clamp_bundle_ui();
+        self.bundle_ui.notice = error.or_else(|| self.bundle_error.clone());
+        self.bundle_ui.pane = BundlePane::List;
+        self.bundle_ui.member_selected = 0;
+        self.overlay = Overlay::Bundles;
+    }
+
+    fn clamp_bundle_ui(&mut self) {
+        if self.bundles.is_empty() {
+            self.bundle_ui.selected = 0;
+            self.bundle_ui.member_selected = 0;
+            self.bundle_ui.pane = BundlePane::List;
+            return;
+        }
+        self.bundle_ui.selected = self.bundle_ui.selected.min(self.bundles.len() - 1);
+        let member_count = self
+            .bundles
+            .get(self.bundle_ui.selected)
+            .map(|bundle| bundle.service_ids.len())
+            .unwrap_or(0);
+        self.bundle_ui.member_selected = self
+            .bundle_ui
+            .member_selected
+            .min(member_count.saturating_sub(1));
+        if member_count == 0 {
+            self.bundle_ui.pane = BundlePane::List;
+        }
+    }
+
+    pub fn selected_bundle(&self) -> Option<&Bundle> {
+        self.bundles.get(self.bundle_ui.selected)
+    }
+
+    pub fn service_index_by_id(&self, service_id: &str) -> Option<usize> {
+        self.services
+            .iter()
+            .position(|service| service.spec.id == service_id)
+    }
+
+    pub fn bundle_status_counts(&self, bundle: &Bundle) -> (usize, usize, usize, usize, usize) {
+        let mut ready = 0;
+        let mut starting = 0;
+        let mut error = 0;
+        let mut stopped = 0;
+        let mut missing = 0;
+        for service_id in &bundle.service_ids {
+            let Some(index) = self.service_index_by_id(service_id) else {
+                missing += 1;
+                continue;
+            };
+            match self.services[index].status() {
+                ServiceStatus::Ready => ready += 1,
+                ServiceStatus::Starting | ServiceStatus::Stopping => starting += 1,
+                ServiceStatus::Error => error += 1,
+                ServiceStatus::Stopped => stopped += 1,
+            }
+        }
+        (ready, starting, error, stopped, missing)
+    }
+
+    pub fn open_bundle_member_logs(&mut self) {
+        let Some(bundle) = self.selected_bundle() else {
+            self.bundle_ui.notice = Some("No bundle selected".to_string());
+            return;
+        };
+        let Some(service_id) = bundle.service_ids.get(self.bundle_ui.member_selected) else {
+            self.bundle_ui.notice = Some("This bundle has no services".to_string());
+            return;
+        };
+        let Some(index) = self.service_index_by_id(service_id) else {
+            self.bundle_ui.notice = Some(format!(
+                "Service {service_id} is no longer available. Rescan or edit the bundle."
+            ));
+            return;
+        };
+        self.open_logs_with_return(index, Overlay::Bundles);
+    }
+
+    pub fn toggle_bundle(&mut self, bundle_id: i64) {
+        if self.active_bundle_id == Some(bundle_id) {
+            self.disable_active_bundle();
+        } else {
+            self.enable_bundle(bundle_id);
+        }
+    }
+
+    pub fn enable_bundle(&mut self, bundle_id: i64) {
+        let Some(bundle) = self
+            .bundles
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .cloned()
+        else {
+            self.bundle_ui.notice = Some("Bundle no longer exists".to_string());
+            return;
+        };
+
+        let available: Vec<Arc<Service>> = bundle
+            .service_ids
+            .iter()
+            .filter_map(|service_id| {
+                self.service_index_by_id(service_id)
+                    .map(|index| Arc::clone(&self.services[index]))
+            })
+            .collect();
+        if available.is_empty() {
+            let message = format!(
+                "Cannot enable \"{}\": none of its services are available",
+                bundle.name
+            );
+            self.bundle_ui.notice = Some(message.clone());
+            self.notify(MessageKind::Error, message);
+            return;
+        }
+
+        let new_ids: HashSet<&str> = bundle.service_ids.iter().map(String::as_str).collect();
+        let mut to_stop = Vec::new();
+        if let Some(previous_id) = self.active_bundle_id
+            && previous_id != bundle_id
+            && let Some(previous) = self
+                .bundles
+                .iter()
+                .find(|previous| previous.id == previous_id)
+        {
+            for service_id in &previous.service_ids {
+                if new_ids.contains(service_id.as_str()) {
+                    continue;
+                }
+                if let Some(index) = self.service_index_by_id(service_id) {
+                    let service = &self.services[index];
+                    if service.is_running() {
+                        to_stop.push(Arc::clone(service));
+                    }
+                }
+            }
+        }
+        for service in &to_stop {
+            process::stop_service(service);
+        }
+
+        self.active_bundle_id = Some(bundle_id);
+        let mut started = 0;
+        let mut already_running = 0;
+        let mut failed = 0;
+        for service in &available {
+            if service.is_running() {
+                already_running += 1;
+                continue;
+            }
+            match process::start_service(service, self.options.ready_timeout) {
+                Ok(()) => started += 1,
+                Err(_) => failed += 1,
+            }
+        }
+
+        let missing = bundle.service_ids.len().saturating_sub(available.len());
+        let mut notice = format!("Enabled \"{}\"", bundle.name);
+        if started > 0 {
+            notice.push_str(&format!(" · started {started}"));
+        }
+        if already_running > 0 {
+            notice.push_str(&format!(" · {already_running} already running"));
+        }
+        if failed > 0 {
+            notice.push_str(&format!(" · {failed} failed"));
+        }
+        if missing > 0 {
+            notice.push_str(&format!(" · {missing} missing"));
+        }
+        let kind = if failed > 0 || missing > 0 {
+            MessageKind::Warning
+        } else {
+            MessageKind::Success
+        };
+        self.bundle_ui.notice = Some(notice.clone());
+        self.bundle_ui.selected = self
+            .bundles
+            .iter()
+            .position(|candidate| candidate.id == bundle_id)
+            .unwrap_or(self.bundle_ui.selected);
+        self.bundle_ui.member_selected = 0;
+        self.notify(kind, notice);
+    }
+
+    pub fn disable_active_bundle(&mut self) {
+        let Some(bundle_id) = self.active_bundle_id.take() else {
+            self.bundle_ui.notice = Some("No bundle is currently enabled".to_string());
+            return;
+        };
+        let Some(bundle) = self
+            .bundles
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .cloned()
+        else {
+            self.bundle_ui.notice = Some("Bundle no longer exists".to_string());
+            return;
+        };
+
+        let mut stopped = 0;
+        for service_id in &bundle.service_ids {
+            if let Some(index) = self.service_index_by_id(service_id) {
+                let service = &self.services[index];
+                if service.is_running() {
+                    process::stop_service(service);
+                    stopped += 1;
+                }
+            }
+        }
+        let notice = if stopped > 0 {
+            format!("Disabled \"{}\" · stopping {stopped}", bundle.name)
+        } else {
+            format!("Disabled \"{}\"", bundle.name)
+        };
+        self.bundle_ui.notice = Some(notice.clone());
+        self.notify(MessageKind::Info, notice);
+    }
+
+    pub fn delete_bundle(&mut self, bundle_id: i64) {
+        let Some(bundle) = self
+            .bundles
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .cloned()
+        else {
+            self.overlay = Overlay::Bundles;
+            self.bundle_ui.notice = Some("Bundle no longer exists".to_string());
+            return;
+        };
+        if self.active_bundle_id == Some(bundle_id) {
+            self.disable_active_bundle();
+        }
+
+        let result = match self.bundle_store.as_mut() {
+            Some(store) => store.delete(bundle_id),
+            None => Err(anyhow::anyhow!("Bundle storage is unavailable")),
+        };
+        self.overlay = Overlay::Bundles;
+        match result {
+            Ok(()) => {
+                let error = self.reload_bundles();
+                self.bundle_ui.notice =
+                    Some(error.unwrap_or_else(|| format!("Deleted \"{}\"", bundle.name)));
+                self.notify(
+                    MessageKind::Info,
+                    format!("Deleted bundle \"{}\"", bundle.name),
+                );
+            }
+            Err(err) => {
+                let message = format!("Could not delete bundle: {err}");
+                self.bundle_ui.notice = Some(message.clone());
+                self.notify(MessageKind::Error, message);
+            }
+        }
+    }
+
+    pub fn open_bundle_editor(&mut self, bundle_id: Option<i64>) {
+        if self.bundle_store.is_none() {
+            self.bundle_ui.notice = Some("Bundle storage is unavailable".to_string());
+            return;
+        }
+        let editor = if let Some(bundle_id) = bundle_id {
+            if self.active_bundle_id == Some(bundle_id) {
+                self.bundle_ui.notice = Some("Disable the bundle before editing it".to_string());
+                return;
+            }
+            let Some(bundle) = self
+                .bundles
+                .iter()
+                .find(|bundle| bundle.id == bundle_id)
+                .cloned()
+            else {
+                self.bundle_ui.notice = Some("Bundle no longer exists".to_string());
+                return;
+            };
+            let missing_services = bundle
+                .service_ids
+                .iter()
+                .filter(|service_id| self.service_index_by_id(service_id).is_none())
+                .count();
+            let cursor = self
+                .services
+                .iter()
+                .position(|service| bundle.service_ids.contains(&service.spec.id))
+                .unwrap_or(0);
+            BundleEditorState {
+                bundle_id: Some(bundle_id),
+                name: bundle.name,
+                selected: bundle.service_ids.into_iter().collect(),
+                cursor,
+                focus: BundleEditorFocus::Name,
+                error: None,
+                missing_services,
+            }
+        } else {
+            BundleEditorState {
+                bundle_id: None,
+                name: String::new(),
+                selected: BTreeSet::new(),
+                cursor: 0,
+                focus: BundleEditorFocus::Name,
+                error: None,
+                missing_services: 0,
+            }
+        };
+        self.bundle_ui.editor = Some(editor);
+        self.bundle_ui.notice = None;
+        self.overlay = Overlay::BundleEditor;
+    }
+
+    pub fn cancel_bundle_editor(&mut self) {
+        self.bundle_ui.editor = None;
+        self.overlay = Overlay::Bundles;
+    }
+
+    fn set_bundle_editor_error(&mut self, message: impl Into<String>) {
+        if let Some(editor) = self.bundle_ui.editor.as_mut() {
+            editor.error = Some(message.into());
+        }
+    }
+
+    pub fn save_bundle_editor(&mut self) {
+        let Some(editor) = self.bundle_ui.editor.as_ref() else {
+            return;
+        };
+        let bundle_id = editor.bundle_id;
+        let name = editor.name.trim().to_string();
+        let selected = editor.selected.clone();
+
+        if name.is_empty() {
+            self.set_bundle_editor_error("Bundle name is required");
+            return;
+        }
+        if name.chars().count() > MAX_BUNDLE_NAME_CHARS {
+            self.set_bundle_editor_error(format!(
+                "Bundle name must be {MAX_BUNDLE_NAME_CHARS} characters or fewer"
+            ));
+            return;
+        }
+        let lower_name = name.to_lowercase();
+        if self
+            .bundles
+            .iter()
+            .any(|bundle| Some(bundle.id) != bundle_id && bundle.name.to_lowercase() == lower_name)
+        {
+            self.set_bundle_editor_error(format!("A bundle named \"{name}\" already exists"));
+            return;
+        }
+
+        let service_ids: Vec<String> = self
+            .services
+            .iter()
+            .filter(|service| selected.contains(&service.spec.id))
+            .map(|service| service.spec.id.clone())
+            .collect();
+        if service_ids.is_empty() {
+            self.set_bundle_editor_error("Select at least one available service");
+            return;
+        }
+
+        let result = match self.bundle_store.as_mut() {
+            Some(store) => match bundle_id {
+                Some(id) => store.update(id, &name, &service_ids).map(|_| id),
+                None => store.create(&name, &service_ids),
+            },
+            None => Err(anyhow::anyhow!("Bundle storage is unavailable")),
+        };
+        match result {
+            Ok(saved_id) => {
+                self.bundle_ui.editor = None;
+                self.overlay = Overlay::Bundles;
+                let error = self.reload_bundles();
+                self.bundle_ui.selected = self
+                    .bundles
+                    .iter()
+                    .position(|bundle| bundle.id == saved_id)
+                    .unwrap_or(self.bundle_ui.selected);
+                self.bundle_ui.member_selected = 0;
+                self.clamp_bundle_ui();
+                self.bundle_ui.notice =
+                    Some(error.unwrap_or_else(|| format!("Saved bundle \"{name}\"")));
+                self.notify(MessageKind::Success, format!("Saved bundle \"{name}\""));
+            }
+            Err(err) => {
+                self.set_bundle_editor_error(format!("Could not save bundle: {err}"));
+            }
+        }
+    }
+
+    fn handle_bundles_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
+                self.bundle_ui.notice = None;
+            }
+            KeyCode::Char('n') => self.open_bundle_editor(None),
+            KeyCode::Char('e') => {
+                if let Some(bundle) = self.selected_bundle().map(|bundle| bundle.id) {
+                    self.open_bundle_editor(Some(bundle));
+                } else {
+                    self.bundle_ui.notice = Some("No bundle selected".to_string());
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(bundle) = self.selected_bundle().map(|bundle| bundle.id) {
+                    self.overlay = Overlay::BundleDelete(bundle);
+                } else {
+                    self.bundle_ui.notice = Some("No bundle selected".to_string());
+                }
+            }
+            KeyCode::Char('o') => self.open_bundle_member_logs(),
+            KeyCode::Enter => {
+                if self.bundle_ui.pane == BundlePane::Members {
+                    self.open_bundle_member_logs();
+                } else if let Some(bundle) = self.selected_bundle().map(|bundle| bundle.id) {
+                    self.toggle_bundle(bundle);
+                } else {
+                    self.bundle_ui.notice = Some("Create a bundle first".to_string());
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.bundle_ui.pane == BundlePane::Members {
+                    self.move_bundle_member(-1);
+                } else {
+                    self.move_bundle_selection(-1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.bundle_ui.pane == BundlePane::Members {
+                    self.move_bundle_member(1);
+                } else {
+                    self.move_bundle_selection(1);
+                }
+            }
+            KeyCode::Tab => {
+                if self.bundle_ui.pane == BundlePane::Members {
+                    self.bundle_ui.pane = BundlePane::List;
+                } else {
+                    let has_members = self
+                        .selected_bundle()
+                        .is_some_and(|bundle| !bundle.service_ids.is_empty());
+                    if has_members {
+                        self.bundle_ui.pane = BundlePane::Members;
+                    } else {
+                        self.bundle_ui.notice = Some("This bundle has no services".to_string());
+                    }
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let has_members = self
+                    .selected_bundle()
+                    .is_some_and(|bundle| !bundle.service_ids.is_empty());
+                if has_members {
+                    self.bundle_ui.pane = BundlePane::Members;
+                } else {
+                    self.bundle_ui.notice = Some("This bundle has no services".to_string());
+                }
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                self.bundle_ui.pane = BundlePane::List;
+            }
+            _ => {}
+        }
+    }
+
+    fn move_bundle_selection(&mut self, delta: isize) {
+        if self.bundles.is_empty() {
+            return;
+        }
+        let last = self.bundles.len() - 1;
+        let next = (self.bundle_ui.selected as isize + delta).clamp(0, last as isize) as usize;
+        if next != self.bundle_ui.selected {
+            self.bundle_ui.selected = next;
+            self.bundle_ui.member_selected = 0;
+            self.bundle_ui.pane = BundlePane::List;
+            self.bundle_ui.notice = None;
+        }
+    }
+
+    fn move_bundle_member(&mut self, delta: isize) {
+        let Some(bundle) = self.selected_bundle() else {
+            return;
+        };
+        if bundle.service_ids.is_empty() {
+            return;
+        }
+        let last = bundle.service_ids.len() - 1;
+        self.bundle_ui.member_selected =
+            (self.bundle_ui.member_selected as isize + delta).clamp(0, last as isize) as usize;
+    }
+
+    fn handle_bundle_editor_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('s')) {
+            self.save_bundle_editor();
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.cancel_bundle_editor(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(editor) = self.bundle_ui.editor.as_mut() {
+                    editor.focus = match editor.focus {
+                        BundleEditorFocus::Name => {
+                            if self.services.is_empty() {
+                                editor.error = Some("No services are available".to_string());
+                                BundleEditorFocus::Name
+                            } else {
+                                editor.error = None;
+                                BundleEditorFocus::Services
+                            }
+                        }
+                        BundleEditorFocus::Services => BundleEditorFocus::Name,
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                let focus = self
+                    .bundle_ui
+                    .editor
+                    .as_ref()
+                    .map(|editor| editor.focus)
+                    .unwrap_or(BundleEditorFocus::Name);
+                if focus == BundleEditorFocus::Name {
+                    if let Some(editor) = self.bundle_ui.editor.as_mut()
+                        && !self.services.is_empty()
+                    {
+                        editor.focus = BundleEditorFocus::Services;
+                        editor.error = None;
+                    }
+                } else {
+                    self.toggle_editor_service();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_editor_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_editor_cursor(1),
+            KeyCode::Char(' ') => {
+                if self
+                    .bundle_ui
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.focus == BundleEditorFocus::Services)
+                {
+                    self.toggle_editor_service();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(editor) = self.bundle_ui.editor.as_mut()
+                    && editor.focus == BundleEditorFocus::Name
+                {
+                    editor.name.pop();
+                    editor.error = None;
+                }
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(editor) = self.bundle_ui.editor.as_mut()
+                    && editor.focus == BundleEditorFocus::Name
+                    && !ch.is_control()
+                    && editor.name.chars().count() < MAX_BUNDLE_NAME_CHARS
+                {
+                    editor.name.push(ch);
+                    editor.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn toggle_editor_service(&mut self) {
+        let Some(cursor) = self.bundle_ui.editor.as_ref().map(|editor| editor.cursor) else {
+            return;
+        };
+        let Some(service_id) = self
+            .services
+            .get(cursor)
+            .map(|service| service.spec.id.clone())
+        else {
+            return;
+        };
+        if let Some(editor) = self.bundle_ui.editor.as_mut() {
+            if !editor.selected.remove(&service_id) {
+                editor.selected.insert(service_id);
+            }
+            editor.error = None;
+        }
+    }
+
+    fn move_editor_cursor(&mut self, delta: isize) {
+        if self.services.is_empty() {
+            return;
+        }
+        if let Some(editor) = self.bundle_ui.editor.as_mut()
+            && editor.focus == BundleEditorFocus::Services
+        {
+            let last = self.services.len() - 1;
+            editor.cursor = (editor.cursor as isize + delta).clamp(0, last as isize) as usize;
+        }
+    }
+
+    fn handle_bundle_delete_key(&mut self, key: KeyEvent, bundle_id: i64) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.delete_bundle(bundle_id)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = Overlay::Bundles;
+            }
+            _ => {}
+        }
     }
 
     pub fn notify(&mut self, kind: MessageKind, text: impl Into<String>) {
@@ -354,10 +1077,15 @@ impl App {
     }
 
     pub fn open_logs(&mut self, index: usize) {
+        self.open_logs_with_return(index, Overlay::None);
+    }
+
+    fn open_logs_with_return(&mut self, index: usize, return_to: Overlay) {
         if index >= self.services.len() {
             return;
         }
         self.selected = index;
+        self.log_return = return_to;
         self.overlay = Overlay::Logs(index);
         self.logs = LogViewState {
             follow: true,
@@ -365,6 +1093,11 @@ impl App {
             h_scroll: 0,
             viewport: self.logs.viewport,
         };
+    }
+
+    fn close_logs(&mut self) {
+        self.overlay = self.log_return;
+        self.log_return = Overlay::None;
     }
 
     pub fn scroll_logs(&mut self, delta: isize) {
@@ -530,6 +1263,8 @@ impl App {
             .unwrap_or_else(|| self.selected.min(self.services.len().saturating_sub(1)));
         self.grid_offset_rows = 0;
         self.overlay = Overlay::None;
+        self.log_return = Overlay::None;
+        self.clamp_bundle_ui();
         self.services_dirty = true;
 
         let added = self.services.len().saturating_sub(preserved + updated);
@@ -593,7 +1328,7 @@ impl App {
             }
             Overlay::Logs(_) => {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_logs(),
                     KeyCode::Up | KeyCode::Char('k') => self.scroll_logs(-1),
                     KeyCode::Down | KeyCode::Char('j') => self.scroll_logs(1),
                     KeyCode::PageUp => self.scroll_logs_page(false),
@@ -608,6 +1343,18 @@ impl App {
                 }
                 return;
             }
+            Overlay::Bundles => {
+                self.handle_bundles_key(key);
+                return;
+            }
+            Overlay::BundleEditor => {
+                self.handle_bundle_editor_key(key);
+                return;
+            }
+            Overlay::BundleDelete(bundle_id) => {
+                self.handle_bundle_delete_key(key, bundle_id);
+                return;
+            }
             Overlay::None => {}
         }
 
@@ -617,6 +1364,7 @@ impl App {
                 self.overlay = Overlay::Help;
                 self.help_scroll = 0;
             }
+            KeyCode::Char('b') => self.open_bundles(),
             KeyCode::Up | KeyCode::Char('k') => self.navigate(0, -1),
             KeyCode::Down | KeyCode::Char('j') => self.navigate(0, 1),
             KeyCode::Left | KeyCode::Char('h') => self.navigate(-1, 0),
@@ -640,13 +1388,29 @@ impl App {
                 Overlay::None => self.navigate(0, -1),
                 Overlay::Logs(_) => self.scroll_logs(-3),
                 Overlay::Help => self.help_scroll = self.help_scroll.saturating_sub(3),
-                Overlay::ConfirmQuit => {}
+                Overlay::Bundles => {
+                    if self.bundle_ui.pane == BundlePane::Members {
+                        self.move_bundle_member(-1);
+                    } else {
+                        self.move_bundle_selection(-1);
+                    }
+                }
+                Overlay::BundleEditor => self.move_editor_cursor(-1),
+                Overlay::ConfirmQuit | Overlay::BundleDelete(_) => {}
             },
             MouseEventKind::ScrollDown => match self.overlay {
                 Overlay::None => self.navigate(0, 1),
                 Overlay::Logs(_) => self.scroll_logs(3),
                 Overlay::Help => self.help_scroll = self.help_scroll.saturating_add(3),
-                Overlay::ConfirmQuit => {}
+                Overlay::Bundles => {
+                    if self.bundle_ui.pane == BundlePane::Members {
+                        self.move_bundle_member(1);
+                    } else {
+                        self.move_bundle_selection(1);
+                    }
+                }
+                Overlay::BundleEditor => self.move_editor_cursor(1),
+                Overlay::ConfirmQuit | Overlay::BundleDelete(_) => {}
             },
             MouseEventKind::Down(MouseButton::Left) if self.overlay == Overlay::None => {
                 let position = (mouse.column, mouse.row);
@@ -712,6 +1476,14 @@ impl App {
             "  c                    Clear the log buffer".to_string(),
             "  Esc / q              Close logs".to_string(),
             String::new(),
+            "Bundles".to_string(),
+            "  b                    Open the bundle manager".to_string(),
+            "  n / e / d            New / edit / delete a bundle".to_string(),
+            "  Enter                Enable or disable selected bundle".to_string(),
+            "  Tab                  Switch between bundles and members".to_string(),
+            "  o                    Logs for the selected member".to_string(),
+            "  Ctrl-S               Save in the bundle editor".to_string(),
+            String::new(),
             "Mouse".to_string(),
             "  Click Start/Logs buttons on a card; wheel scrolls.".to_string(),
             String::new(),
@@ -731,6 +1503,13 @@ impl App {
                 self.options.ready_timeout.as_secs(),
                 self.options.stop_timeout.as_secs(),
                 self.options.log_capacity
+            ),
+            format!(
+                "  bundles: {}",
+                self.bundle_db_path()
+                    .map(|path| path.display().to_string())
+                    .or_else(|| self.bundle_error.clone())
+                    .unwrap_or_else(|| "unavailable".to_string())
             ),
         ];
 
@@ -803,10 +1582,16 @@ mod tests {
             hit_areas: Vec::new(),
             should_quit: false,
             metrics_enabled: true,
+            bundles: Vec::new(),
+            active_bundle_id: None,
+            bundle_ui: BundleUiState::default(),
             message: None,
             config_override: None,
             metrics_cli_enabled: true,
             services_dirty: false,
+            bundle_store: None,
+            bundle_error: None,
+            log_return: Overlay::None,
         }
     }
 

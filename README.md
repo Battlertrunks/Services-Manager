@@ -18,7 +18,7 @@ and watch CPU/memory without leaving the terminal.
  │ Stop    Logs                     │ │ Stop    Logs                     │ │ Start    Logs   │
  │$ npm run dev                     │ │$ npm start                       │ │✖ cannot find …  │
  ╰──────────────────────────────────╯ ╰──────────────────────────────────╯ ╰─────────────────╯
-↑↓←→/hjkl move · enter start/stop · o logs · a start all · x stop all · r rescan · ? help · q quit
+↑↓←→/hjkl move · enter start/stop · o logs · b bundles · a/x start/stop all · ? help · q quit
 ▸ shell-mfe  apps/shell  ·  npm run dev  ·  :5173
 ```
 
@@ -31,6 +31,8 @@ and watch CPU/memory without leaving the terminal.
 - Start all / stop all, workspace rescan, keyboard and mouse control.
 - CPU and resident-memory sampling for the entire npm → shell → node process tree.
 - Automatic project discovery and type detection (MFE vs service), with an optional TOML config.
+- Persisted **bundles** for starting groups of services together, with one active bundle at a time,
+  bundle member status, and direct access to each member's logs.
 - Every service runs in its own process group, so stopping it also stops the node process it
   spawned. Leftover descendants are cleaned up and escalated to SIGKILL when necessary.
 - Services are stopped on normal exit (with confirmation if any are running), on external
@@ -132,6 +134,28 @@ stop/restart and are cleared when the service definition is updated by a rescan,
 with `c` in the modal. Pausing keeps the same line anchored even while new output pushes older
 lines out of the ring buffer. Nothing is written to disk.
 
+## Bundles
+
+Press `b` to open the bundle manager. A bundle is a named selection of services that can be
+started together, making it easy to bring up a paired MFE and API (or any larger set).
+
+- `n` creates a bundle: type a name, press `Tab`, select services with `Space`/`Enter`, then save
+  with `Ctrl+S`.
+- `e` edits the selected bundle, and `d` deletes it after confirmation.
+- `Enter` enables or disables the selected bundle. **Only one bundle can be enabled at a time.**
+  Enabling a different bundle stops services that belonged only to the previous bundle, then starts
+  the new bundle's services. Services shared by both bundles keep running.
+- The details pane shows every bundled service with its status, port, type, and a `missing` marker
+  if the service no longer exists after a rescan. Press `Tab` to focus the member list and `o`
+  (or `Enter`) to view that member's live logs. Closing the logs returns to the bundle manager.
+- An active bundle cannot be edited; disable it first. Deleting an active bundle stops its running
+  services before removing it.
+- Bundle definitions persist in SQLite at `.services-manager/bundles.sqlite3` under the workspace
+  root. Active/enabled state is runtime-only and is cleared when the app exits.
+
+Manual card-level start/stop still works exactly as before, even while a bundle is enabled. This
+lets you add or stop individual processes without changing the bundle definition.
+
 ## Metrics
 
 When enabled, a background thread samples the process tree rooted at each npm process every
@@ -152,6 +176,7 @@ Disable sampling with `--no-metrics` or `metrics = false` in the config.
 | `o` | Open live logs |
 | `a` | Start all services |
 | `x` | Stop all services |
+| `b` | Open the bundle manager |
 | `r` | Rescan the workspace (only while nothing is running) |
 | `?` | Help and discovery warnings |
 | `q` / `Ctrl+C` | Quit (asks for confirmation while services are running) |
@@ -166,6 +191,28 @@ In the logs modal:
 | `←` `→` | Pan horizontally |
 | `c` | Clear the buffer |
 | `Esc` / `q` | Close |
+
+In the bundle manager:
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` / `j` `k` | Move through bundles or members |
+| `Tab` / `Shift+Tab` | Switch between the bundle list and member list |
+| `Enter` | Enable/disable the bundle (list) or open member logs (members) |
+| `o` | Open logs for the selected member |
+| `n` / `e` / `d` | New / edit / delete bundle |
+| `Esc` / `q` | Close |
+
+In the bundle editor:
+
+| Key | Action |
+| --- | --- |
+| Text | Type the bundle name |
+| `Tab` | Switch between name and service selection |
+| `↑` `↓` | Move through services |
+| `Space` / `Enter` | Toggle the selected service |
+| `Ctrl+S` | Save |
+| `Esc` | Cancel |
 
 Mouse works too: click a card's Start/Stop or Logs button, use the wheel to move/scroll. A second
 `Ctrl+C` confirms the quit dialog.
@@ -234,11 +281,12 @@ Layout of the source:
 | Path | Responsibility |
 | --- | --- |
 | `src/workspace.rs` | Discovery, `package.json` parsing, config, readiness/error patterns |
+| `src/bundles.rs` | SQLite bundle definitions and CRUD |
 | `src/service.rs` | Per-service runtime state, statuses, log ring buffer, metrics |
 | `src/process.rs` | Spawning npm in process groups, log streaming, stop/shutdown |
 | `src/metrics.rs` | Background CPU/memory sampling of process trees |
-| `src/app.rs` | UI state, actions, key/mouse handling, rescan |
-| `src/ui/` | Card grid, logs modal, help and quit dialogs |
+| `src/app.rs` | UI state, actions, key/mouse handling, rescan, bundle activation |
+| `src/ui/` | Card grid, bundle manager/editor, logs modal, help and quit dialogs |
 | `src/main.rs` | CLI, terminal lifecycle, async event loop |
 
 ## Troubleshooting
@@ -251,6 +299,10 @@ Layout of the source:
 - **A project is missing** — it needs a `dev`/`start`/`serve` script. Check the warnings under `?`,
   or define it explicitly in `services-manager.toml`. Nested projects deeper than two levels
   require a config entry.
+- **A bundle member shows `missing`** — the service disappeared or its configured ID changed during
+  a rescan. Disable the active bundle if necessary, edit it, and reselect the service.
+- **Bundle data** — definitions live in `.services-manager/bundles.sqlite3` in the workspace.
+  Add `.services-manager/` to that workspace's `.gitignore` if you keep bundles local.
 - **Ports are occupied after a crash** — stopping and quitting clean up the whole process group,
   including descendants that ignore SIGTERM, and external SIGTERM/SIGHUP/SIGINT trigger the same
   cleanup. If the app was force-killed with SIGKILL, find the leftover node process with

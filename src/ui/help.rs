@@ -71,7 +71,7 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
 fn is_section_heading(text: &str) -> bool {
     matches!(
         text,
-        "Navigation" | "Logs" | "Mouse" | "Workspace" | "Warnings"
+        "Navigation" | "Logs" | "Bundles" | "Mouse" | "Workspace" | "Warnings"
     )
 }
 

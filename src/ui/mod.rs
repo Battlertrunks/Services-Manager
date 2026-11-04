@@ -1,5 +1,6 @@
 //! Terminal rendering.
 
+mod bundles;
 mod dashboard;
 mod help;
 mod logs;
@@ -49,6 +50,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Overlay::Help => lines.push(Line::from(Span::styled(
                 "Help is open · Esc/q to close",
                 Style::new().fg(Color::Cyan),
+            ))),
+            Overlay::Bundles => lines.push(Line::from(Span::styled(
+                "Bundles need more space · Esc/q to close",
+                Style::new().fg(Color::Cyan),
+            ))),
+            Overlay::BundleEditor => lines.push(Line::from(Span::styled(
+                "Bundle editor · Ctrl-S save / Esc cancel",
+                Style::new().fg(Color::Cyan),
+            ))),
+            Overlay::BundleDelete(_) => lines.push(Line::from(Span::styled(
+                "Delete bundle? · y confirm / n cancel",
+                Style::new().fg(Color::Yellow),
             ))),
             Overlay::ConfirmQuit => lines.push(Line::from(Span::styled(
                 format!("Quit? {} running · y quit / n cancel", app.running_count()),
@@ -105,6 +118,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Overlay::Logs(index) => logs::render(frame, app, index),
         Overlay::Help => help::render_help(frame, app),
         Overlay::ConfirmQuit => help::render_quit(frame, app),
+        Overlay::Bundles => bundles::render(frame, app),
+        Overlay::BundleEditor => bundles::render_editor(frame, app),
+        Overlay::BundleDelete(bundle_id) => bundles::render_delete(frame, app, bundle_id),
     }
 }
 
@@ -114,6 +130,9 @@ fn overlay_area(overlay: Overlay, area: Rect) -> Option<Rect> {
         Overlay::Logs(_) => Some(logs::area(area)),
         Overlay::Help => Some(help::help_area(area)),
         Overlay::ConfirmQuit => Some(help::quit_area(area)),
+        Overlay::Bundles => Some(bundles::area(area)),
+        Overlay::BundleEditor => Some(bundles::editor_area(area)),
+        Overlay::BundleDelete(_) => Some(bundles::delete_area(area)),
     }
 }
 
@@ -261,9 +280,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints = if area.width < 60 {
         "↑↓←→ · enter · o logs · ? help · q quit"
     } else if area.width < 90 {
-        "↑↓←→ move · enter toggle · o logs · ? help · q quit"
+        "↑↓←→ move · enter toggle · o logs · b bundles · ? help · q quit"
     } else {
-        "↑↓←→/hjkl move · enter start/stop · o logs · a start all · x stop all · r rescan · ? help · q quit"
+        "↑↓←→/hjkl move · enter start/stop · o logs · b bundles · a start all · x stop all · r rescan · ? help · q quit"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(

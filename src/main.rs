@@ -1,10 +1,14 @@
 mod app;
+mod bundles;
 mod metrics;
 mod process;
 mod service;
 mod text;
 mod ui;
 mod workspace;
+
+#[cfg(test)]
+mod bundle_tests;
 
 use std::io::stdout;
 use std::path::PathBuf;
@@ -44,7 +48,8 @@ Each project needs a package.json with a dev, start, or serve script.
 
 Keys:
     ↑↓←→ / hjkl    move          enter/space    start or stop
-    o              logs          a / x          start all / stop all
+    o              logs          b              bundles
+    a / x          start all / stop all
     r              rescan        ?              help
     q / ctrl-c     quit (asks first when services are running)
 
