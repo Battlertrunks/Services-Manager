@@ -700,6 +700,42 @@ fn bundle_manager_renders_empty_state() {
     render_at_common_sizes(&mut app);
 }
 
+#[test]
+fn dashboard_renders_port_on_its_own_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app_with_services(temp.path(), &["alpha"]);
+    app.metrics_enabled = true;
+    let service = app.services[0].clone();
+    service.runtime.begin_start(Some(5173)).unwrap();
+    let run_id = service
+        .runtime
+        .install_run(
+            42,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+    service
+        .runtime
+        .set_metrics_for(run_id, 42, 100.0, 1024 * 1024 * 1024);
+
+    let text = rendered_text(&mut app, 60, 20);
+    let rows: Vec<&str> = text.lines().collect();
+    let metrics_row = rows
+        .iter()
+        .position(|row| row.contains("cpu 100%") && row.contains("mem 1.0G"))
+        .expect("metrics row should render");
+    assert!(
+        !rows[metrics_row].contains(":5173"),
+        "port should not share the metrics row: {}",
+        rows[metrics_row]
+    );
+    assert!(
+        rows.get(metrics_row + 1)
+            .is_some_and(|row| row.contains(":5173")),
+        "port should render on its own row directly below metrics"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn only_one_bundle_is_active_and_shared_services_keep_running() {

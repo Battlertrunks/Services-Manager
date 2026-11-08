@@ -12,7 +12,7 @@ use crate::app::{App, CardHitArea};
 use crate::service::{Service, ServiceStatus};
 use crate::ui::{format_memory, kind_color, status_color};
 
-const CARD_HEIGHT: u16 = 8;
+const CARD_HEIGHT: u16 = 9;
 const GAP: u16 = 1;
 const MIN_CARD_WIDTH: u16 = 30;
 const MAX_CARD_WIDTH: u16 = 54;
@@ -95,6 +95,7 @@ fn render_card(frame: &mut Frame, app: &mut App, index: usize, rect: Rect) {
         service.spec.relative_path()
     };
     let metrics_line = metrics_line(&service, app.metrics_enabled);
+    let port_line = port_line(&service);
     let hint_line = hint_line(&service, status, inner.width);
 
     let mut lines = vec![
@@ -102,18 +103,19 @@ fn render_card(frame: &mut Frame, app: &mut App, index: usize, rect: Rect) {
         Line::from(Span::styled(service.spec.name.clone(), name_style)),
         Line::from(Span::styled(path, Style::new().fg(Color::DarkGray))),
         metrics_line,
+        port_line,
         Line::from(""),
         hint_line,
     ];
-    if inner.height < 6 {
+    if inner.height < 7 {
         lines.truncate(inner.height as usize);
     }
     frame.render_widget(Paragraph::new(lines), inner);
 
     let mut toggle_hit = None;
     let mut logs_hit = Rect::new(0, 0, 0, 0);
-    if inner.height >= 5 {
-        let button_y = inner.y + 4;
+    if inner.height >= 6 {
+        let button_y = inner.y + 5;
         let (toggle_text, toggle_style) = if status == ServiceStatus::Stopping {
             (
                 " Stopping ",
@@ -216,13 +218,18 @@ fn metrics_line(service: &Service, metrics_enabled: bool) -> Line<'static> {
             parts.push("mem —".to_string());
         }
     }
-    if let Some(port) = service.port() {
-        parts.push(format!(":{port}"));
-    }
     Line::from(Span::styled(
         parts.join("  ·  "),
         Style::new().fg(Color::Gray),
     ))
+}
+
+fn port_line(service: &Service) -> Line<'static> {
+    let port = service
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    Line::from(Span::styled(port, Style::new().fg(Color::Gray)))
 }
 
 fn hint_line(service: &Service, status: ServiceStatus, width: u16) -> Line<'static> {

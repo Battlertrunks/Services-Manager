@@ -14,7 +14,8 @@ and watch CPU/memory without leaving the terminal.
  │● ready                        MFE│ │● starting                     MFE│ │● error       SVC│
  │shell-mfe                         │ │checkout-mfe                      │ │payments-api     │
  │apps/shell                        │ │apps/checkout                     │ │services/payments│
- │cpu 1%  ·  mem 142M  ·  :5173     │ │cpu —  ·  mem —                   │ │cpu —  ·  mem —  │
+ │cpu 1%  ·  mem 142M               │ │cpu —  ·  mem —                   │ │cpu —  ·  mem —  │
+ │:5173                             │ │                                  │ │                 │
  │ Stop    Logs                     │ │ Stop    Logs                     │ │ Start    Logs   │
  │$ npm run dev                     │ │$ npm start                       │ │✖ cannot find …  │
  ╰──────────────────────────────────╯ ╰──────────────────────────────────╯ ╰─────────────────╯
